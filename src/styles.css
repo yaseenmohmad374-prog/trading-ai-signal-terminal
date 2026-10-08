@@ -1,0 +1,211 @@
+import { Candle, Signal, SignalStatus, Timeframe } from '../types';
+import { atr, detectStructure, detectSupportResistance, ema, macd, rsi, vwap } from './indicators';
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getHigherTimeframeBias(candles: Candle[]) {
+  if (!candles.length) return 'محايد';
+
+  const closes = candles.map((candle) => candle.close);
+  const fast = ema(closes, 9).at(-1) ?? closes.at(-1) ?? 0;
+  const slow = ema(closes, 21).at(-1) ?? closes.at(-1) ?? 0;
+
+  return fast > slow ? 'شراء' : fast < slow ? 'بيع' : 'محايد';
+}
+
+export function buildSignal(
+  symbol: string,
+  candlesByTf: Partial<Record<Timeframe, Candle[]>>,
+  price: number,
+): Signal {
+  const tf5 = candlesByTf['5m'] ?? [];
+  const tf15 = candlesByTf['15m'] ?? [];
+  const tf1h = candlesByTf['1h'] ?? [];
+  const tf4h = candlesByTf['4h'] ?? [];
+
+  const closes5 = tf5.map((candle) => candle.close);
+  const closes15 = tf15.map((candle) => candle.close);
+  const closes1h = tf1h.map((candle) => candle.close);
+  const closes4h = tf4h.map((candle) => candle.close);
+
+  const emaFast5 = ema(closes5, 9).at(-1) ?? price;
+  const emaSlow5 = ema(closes5, 21).at(-1) ?? price;
+  const emaFast15 = ema(closes15, 9).at(-1) ?? price;
+  const emaSlow15 = ema(closes15, 21).at(-1) ?? price;
+  const emaFast1h = ema(closes1h, 9).at(-1) ?? price;
+  const emaSlow1h = ema(closes1h, 21).at(-1) ?? price;
+  const emaFast4h = ema(closes4h, 9).at(-1) ?? price;
+  const emaSlow4h = ema(closes4h, 21).at(-1) ?? price;
+
+  const rsi5 = rsi(closes5).at(-1) ?? 50;
+  const rsi15 = rsi(closes15).at(-1) ?? 50;
+  const macdData = macd(closes5);
+  const macdHistogram = macdData.histogram.at(-1) ?? 0;
+  const vwapValue = vwap(tf5, 20);
+  const atrValue = atr(tf5, 14);
+
+  const structure5 = detectStructure(tf5, 24);
+  const structure15 = detectStructure(tf15, 30);
+  const structure1h = detectStructure(tf1h, 40);
+  const supportResistance = detectSupportResistance(tf5, 60);
+
+  let score = 0;
+  let bullishBias = false;
+  let bearishBias = false;
+
+  if (emaFast5 > emaSlow5) {
+    score += 18;
+    bullishBias = true;
+  } else {
+    score -= 18;
+    bearishBias = true;
+  }
+
+  if (emaFast15 > emaSlow15) {
+    score += 14;
+    bullishBias = true;
+  } else {
+    score -= 14;
+    bearishBias = true;
+  }
+
+  if (rsi5 > 55 && rsi5 < 70) {
+    score += 12;
+  } else if (rsi5 < 45) {
+    score -= 12;
+  }
+
+  if (macdHistogram > 0) {
+    score += 10;
+    bullishBias = true;
+  } else {
+    score -= 10;
+    bearishBias = true;
+  }
+
+  if (price > vwapValue) {
+    score += 8;
+  } else {
+    score -= 8;
+  }
+
+  if (structure5.bullish || structure15.bullish) {
+    score += 12;
+  }
+
+  if (structure5.bearish || structure15.bearish) {
+    score -= 12;
+  }
+
+  const higherBias = getHigherTimeframeBias(tf1h);
+  if (higherBias === 'شراء') {
+    score += 20;
+  } else if (higherBias === 'بيع') {
+    score -= 20;
+  }
+
+  if (emaFast1h > emaSlow1h && emaFast4h > emaSlow4h) {
+    score += 18;
+    bullishBias = true;
+  } else if (emaFast1h < emaSlow1h && emaFast4h < emaSlow4h) {
+    score -= 18;
+    bearishBias = true;
+  }
+
+  if (structure1h.bullish && higherBias === 'شراء') {
+    score += 12;
+  }
+
+  if (structure1h.bearish && higherBias === 'بيع') {
+    score -= 12;
+  }
+
+  if (rsi15 > 60 && higherBias === 'شراء') {
+    score += 7;
+  }
+
+  if (rsi15 < 40 && higherBias === 'بيع') {
+    score -= 7;
+  }
+
+  const stopDistance = atrValue || price * 0.012;
+  const risk = Math.max(stopDistance * 1.5, 0.003 * price);
+  const entry = price;
+  const stopLoss =
+    bullishBias && score > 0 ? Math.min(price - risk * 0.8, supportResistance.support) : price + risk;
+  const sellStop =
+    bearishBias && score < 0 ? Math.max(price + risk * 0.8, supportResistance.resistance) : price - risk;
+
+  const finalStopLoss = score > 0 ? stopLoss : sellStop;
+  const tp1 = score > 0 ? price + risk * 1.5 : price - risk * 1.5;
+  const tp2 = score > 0 ? price + risk * 2.5 : price - risk * 2.5;
+  const tp3 = score > 0 ? price + risk * 4 : price - risk * 4;
+
+  let status: SignalStatus = 'انتظار';
+  let direction: Signal['direction'] = 'neutral';
+  let tradeBias: Signal['tradeBias'] = 'محايد';
+  let confidence = 45;
+
+  const higherTrendConfirmed = higherBias === 'شراء' || higherBias === 'بيع';
+  const strongBullish = score >= 72 && higherBias === 'شراء';
+  const strongBearish = score <= -72 && higherBias === 'بيع';
+  const regularBullish = score >= 40 && score < 72 && higherBias === 'شراء';
+  const regularBearish = score <= -40 && score > -72 && higherBias === 'بيع';
+
+  if (strongBullish) {
+    status = 'شراء قوي';
+    direction = 'buy';
+    tradeBias = 'شراء';
+    confidence = clamp(Math.round((score + 80) / 2), 70, 96);
+  } else if (regularBullish) {
+    status = 'شراء';
+    direction = 'buy';
+    tradeBias = 'شراء';
+    confidence = clamp(Math.round((score + 60) / 2), 58, 78);
+  } else if (strongBearish) {
+    status = 'بيع قوي';
+    direction = 'sell';
+    tradeBias = 'بيع';
+    confidence = clamp(Math.round((Math.abs(score) + 80) / 2), 70, 96);
+  } else if (regularBearish) {
+    status = 'بيع';
+    direction = 'sell';
+    tradeBias = 'بيع';
+    confidence = clamp(Math.round((Math.abs(score) + 60) / 2), 58, 78);
+  } else if (Math.abs(score) < 25 || !higherTrendConfirmed) {
+    status = 'لا توجد صفقة';
+    direction = 'neutral';
+    tradeBias = 'محايد';
+    confidence = 18;
+  } else {
+    status = 'انتظار';
+    direction = 'neutral';
+    tradeBias = 'محايد';
+    confidence = 52;
+  }
+
+  const riskReward = score > 0 ? (tp1 - entry) / Math.abs(entry - finalStopLoss) : (entry - tp1) / Math.abs(finalStopLoss - entry);
+
+  const reason = `هيكل السوق ${structure1h.trend}، تقاطع EMA ${emaFast5 > emaSlow5 ? 'صاعد' : 'هابط'}، RSI ${rsi5.toFixed(1)}، VWAP ${vwapValue.toFixed(2)}، والـ H1/H4 ${higherBias === 'شراء' ? 'تؤكد الاتجاه الصاعد' : higherBias === 'بيع' ? 'تؤكد الاتجاه الهابط' : 'غير مؤكدة'}.`;
+
+  return {
+    id: `${symbol}-${Date.now()}`,
+    symbol,
+    status,
+    direction,
+    timeframe: '5m / 1H / 4H',
+    entry,
+    stopLoss: finalStopLoss,
+    tp1,
+    tp2,
+    tp3,
+    confidence,
+    riskReward: Number(Math.max(riskReward, 0.1).toFixed(2)),
+    tradeBias,
+    timestamp: new Date().toISOString(),
+    validForMinutes: 15,
+    reason,
+  };
+}
