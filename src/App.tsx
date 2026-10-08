@@ -1,326 +1,416 @@
-:root {
-  font-family: "Tahoma", "Segoe UI", sans-serif;
-  color: #e5f0ff;
-  background: #07131f;
-  line-height: 1.5;
-  font-weight: 500;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  direction: rtl;
+import { useEffect, useRef, useState } from 'react';
+import {
+  CandlestickSeries,
+  ColorType,
+  HistogramSeries,
+  PriceLineSource,
+  createChart,
+  type IChartApi,
+  type UTCTimestamp,
+} from 'lightweight-charts';
+import { getSymbols, getCandles, getTicker, watchTicker } from './lib/marketService';
+import { analyze } from './lib/signalEngine';
+import { Candle, Signal } from './types';
+
+function formatPrice(val: number) {
+  return val.toLocaleString('ar-EG', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
 }
 
-* {
-  box-sizing: border-box;
+function formatTime(iso: string) {
+  return new Date(iso).toLocaleString('ar-EG', { dateStyle: 'short', timeStyle: 'short' });
 }
 
-html, body, #root {
-  margin: 0;
-  min-height: 100%;
-  min-width: 320px;
-  background:
-    radial-gradient(circle at top, rgba(10, 79, 125, 0.28), transparent 32%),
-    linear-gradient(180deg, #050d16 0%, #081722 100%);
+function App() {
+  const chartRef = useRef<IChartApi | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const [symbols, setSymbols] = useState<string[]>([]);
+  const [symbol, setSymbol] = useState('BTCUSDT');
+  const [tf, setTf] = useState('1h');
+  const [search, setSearch] = useState('');
+
+  const [signal, setSignal] = useState<Signal | null>(null);
+  const [price, setPrice] = useState<number>(0);
+  const [change, setChange] = useState<number>(0);
+  const [loading, setLoading] = useState(true);
+  const [history, setHistory] = useState<Signal[]>([]);
+
+  const [candles5m, setCandles5m] = useState<Candle[]>([]);
+  const [candles1h, setCandles1h] = useState<Candle[]>([]);
+  const [candles4h, setCandles4h] = useState<Candle[]>([]);
+  const [chartCandles, setChartCandles] = useState<Candle[]>([]);
+
+  // تحميل الرموز
+  useEffect(() => {
+    (async () => {
+      try {
+        const syms = await getSymbols();
+        setSymbols(syms);
+      } catch (err) {
+        console.error('Failed to load symbols:', err);
+      }
+    })();
+  }, []);
+
+  // تحميل البيانات والإشارات
+  useEffect(() => {
+    let cancelled = false;
+
+    const refresh = async () => {
+      setLoading(true);
+      try {
+        const [c5, c1, c4, ticker] = await Promise.all([
+          getCandles(symbol, '5m', 300),
+          getCandles(symbol, '1h', 300),
+          getCandles(symbol, '4h', 300),
+          getTicker(symbol),
+        ]);
+
+        if (cancelled) return;
+
+        setCandles5m(c5);
+        setCandles1h(c1);
+        setCandles4h(c4);
+
+        // اختر الشموع للعرض بناءً على الفريم المختار
+        const tfMap: Record<string, Candle[]> = { '5m': c5, '1h': c1, '4h': c4, '1d': c1 };
+        setChartCandles(tfMap[tf] || c1);
+
+        setPrice(ticker.price);
+        setChange(ticker.change);
+
+        const sig = analyze(symbol, c5, c1, c4, ticker.price);
+        setSignal(sig);
+
+        if (sig.direction !== 'neutral') {
+          setHistory((prev) => [sig, ...prev].slice(0, 8));
+        }
+      } catch (err) {
+        console.error('Failed to refresh data:', err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    refresh();
+    const interval = setInterval(refresh, 12000); // تحديث كل 12 ثانية
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [symbol, tf]);
+
+  // الاشتراك في تحديثات السعر الفورية
+  useEffect(() => {
+    if (!symbol) return;
+    return watchTicker(symbol, (newPrice) => {
+      setPrice(newPrice);
+    });
+  }, [symbol]);
+
+  // رسم الشارت
+  useEffect(() => {
+    if (!containerRef.current || !chartCandles.length) return;
+
+    const chart = createChart(containerRef.current, {
+      width: containerRef.current.clientWidth,
+      height: containerRef.current.clientHeight,
+      layout: {
+        background: { type: ColorType.Solid, color: '#050f1a' },
+        textColor: '#8fa3c1',
+      },
+      grid: {
+        vertLines: { color: 'rgba(76, 110, 160, 0.1)' },
+        horzLines: { color: 'rgba(76, 110, 160, 0.1)' },
+      },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+        borderColor: 'rgba(76, 110, 160, 0.2)',
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(76, 110, 160, 0.2)',
+        autoScale: true,
+      },
+      crosshair: { mode: 1 },
+    });
+
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: '#00d97e',
+      downColor: '#ff4561',
+      borderUpColor: '#00d97e',
+      borderDownColor: '#ff4561',
+      wickUpColor: '#00d97e',
+      wickDownColor: '#ff4561',
+    });
+
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      color: '#3b82f6',
+      priceScaleId: '',
+      lastValueVisible: false,
+    });
+
+    const candleData = chartCandles.map((c) => ({
+      time: (Math.floor(c.time / 1000) || Math.floor(Date.now() / 1000)) as UTCTimestamp,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+
+    const volumeData = chartCandles.map((c) => ({
+      time: (Math.floor(c.time / 1000) || Math.floor(Date.now() / 1000)) as UTCTimestamp,
+      value: c.volume,
+      color: c.close >= c.open ? 'rgba(0, 217, 126, 0.3)' : 'rgba(255, 69, 97, 0.3)',
+    }));
+
+    candleSeries.setData(candleData);
+    volumeSeries.setData(volumeData);
+
+    // رسم خطوط الإشارة
+    if (signal && signal.direction !== 'neutral') {
+      candleSeries.createPriceLine({
+        price: signal.entry,
+        color: '#00b7ff',
+        lineWidth: 2,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: 'Entry',
+        priceLineSource: PriceLineSource.LastBar,
+      });
+
+      candleSeries.createPriceLine({
+        price: signal.stopLoss,
+        color: '#ff4561',
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: 'SL',
+        priceLineSource: PriceLineSource.LastBar,
+      });
+
+      candleSeries.createPriceLine({
+        price: signal.tp1,
+        color: '#00d97e',
+        lineWidth: 1,
+        lineStyle: 3,
+        axisLabelVisible: true,
+        title: 'TP1',
+        priceLineSource: PriceLineSource.LastBar,
+      });
+
+      candleSeries.createPriceLine({
+        price: signal.tp2,
+        color: '#00d97e',
+        lineWidth: 1,
+        lineStyle: 3,
+        axisLabelVisible: true,
+        title: 'TP2',
+        priceLineSource: PriceLineSource.LastBar,
+      });
+
+      candleSeries.createPriceLine({
+        price: signal.tp3,
+        color: '#00d97e',
+        lineWidth: 1,
+        lineStyle: 3,
+        axisLabelVisible: true,
+        title: 'TP3',
+        priceLineSource: PriceLineSource.LastBar,
+      });
+    }
+
+    chart.timeScale().fitContent();
+    chartRef.current = chart;
+
+    const handleResize = () => {
+      if (containerRef.current) {
+        chart.applyOptions({ width: containerRef.current.clientWidth });
+      }
+    };
+
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(containerRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      chartRef.current = null;
+    };
+  }, [chartCandles, signal, tf]);
+
+  const filteredSymbols = symbols.filter((s) => s.includes(search.toUpperCase()));
+
+  const signalStatusClass = signal
+    ? signal.status === 'شراء قوي'
+      ? 'signal-strong-buy'
+      : signal.status === 'شراء'
+        ? 'signal-buy'
+        : signal.status === 'بيع قوي'
+          ? 'signal-strong-sell'
+          : signal.status === 'بيع'
+            ? 'signal-sell'
+            : 'signal-neutral'
+    : 'signal-neutral';
+
+  return (
+    <div className="container">
+      <header className="header">
+        <div className="brand">
+          <div className="logo">AI</div>
+          <div className="title">
+            <h1>Trading AI Signal Terminal</h1>
+            <p>محرك تحليل فني وإشارات سوق فعلية</p>
+          </div>
+        </div>
+
+        <div className="controls">
+          <input
+            type="text"
+            className="search"
+            placeholder="ابحث عن رمز..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+
+          <select
+            className="select-symbol"
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value)}
+          >
+            {filteredSymbols.length > 0
+              ? filteredSymbols.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))
+              : symbols.slice(0, 20).map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+          </select>
+
+          <select className="select-tf" value={tf} onChange={(e) => setTf(e.target.value)}>
+            <option value="5m">5m</option>
+            <option value="1h">1h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1d</option>
+          </select>
+        </div>
+      </header>
+
+      <main className="main">
+        <section className="chart-section">
+          <div className="chart-header">
+            <div className="symbol-display">
+              <span className="symbol-name">{symbol}</span>
+              <span className={`price-display ${change >= 0 ? 'price-up' : 'price-down'}`}>
+                {formatPrice(price)} {change >= 0 ? '+' : ''}{change.toFixed(2)}%
+              </span>
+            </div>
+            <div className="chart-info">
+              <span className="badge">الفريم: {tf}</span>
+              <span className="badge">{loading ? '⟳ تحديث...' : '● مباشر'}</span>
+            </div>
+          </div>
+          <div className="chart-container" ref={containerRef} />
+        </section>
+
+        <aside className="sidebar">
+          <div className="panel">
+            <div className="panel-title">الإشارة الحالية</div>
+            {signal ? (
+              <>
+                <div className={`signal-badge ${signalStatusClass}`}>{signal.status}</div>
+
+                <div className="stats-grid">
+                  <div className="stat">
+                    <div className="stat-label">الدخول</div>
+                    <div className="stat-value">{formatPrice(signal.entry)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">وقف الخسارة</div>
+                    <div className="stat-value">{formatPrice(signal.stopLoss)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">TP1</div>
+                    <div className="stat-value">{formatPrice(signal.tp1)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">TP2</div>
+                    <div className="stat-value">{formatPrice(signal.tp2)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">TP3</div>
+                    <div className="stat-value">{formatPrice(signal.tp3)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">RR</div>
+                    <div className="stat-value">{signal.riskReward.toFixed(2)}x</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">ثقة</div>
+                    <div className="stat-value">{signal.confidence}%</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">الفريم</div>
+                    <div className="stat-value">{signal.timeframe}</div>
+                  </div>
+                </div>
+
+                <div className="reason-box"><strong>السبب:</strong> {signal.reason}</div>
+              </>
+            ) : (
+              <div className="loading">جاري التحليل...</div>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">حالة السوق</div>
+            <div className="metrics-grid">
+              <div className="metric">
+                <div className="metric-label">الاتجاه</div>
+                <div className="metric-value">{change >= 0 ? '📈 صاعد' : '📉 هابط'}</div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">التغير</div>
+                <div className="metric-value">{Math.abs(change).toFixed(2)}%</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">السجل الأخير</div>
+            <div className="history-list">
+              {history.length > 0 ? (
+                history.map((h) => (
+                  <div key={h.id} className="history-item">
+                    <div>
+                      <strong>{h.symbol}</strong>
+                      <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                        {formatTime(h.timestamp)}
+                      </div>
+                    </div>
+                    <div
+                      className={`history-status ${h.direction === 'buy' ? 'status-buy' : 'status-sell'}`}
+                    >
+                      {h.status}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', padding: '20px' }}>
+                  لا توجد إشارات بعد
+                </div>
+              )}
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
 }
 
-body {
-  min-height: 100vh;
-  color: #edf5ff;
-  direction: rtl;
-}
-
-button, input, select {
-  font: inherit;
-}
-
-.app-shell {
-  min-height: 100vh;
-  padding: 18px;
-  color: #edf5ff;
-}
-
-.dark-panel {
-  background: rgba(12, 20, 31, 0.92);
-  border: 1px solid rgba(128, 170, 255, 0.14);
-  border-radius: 16px;
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28);
-}
-
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  padding: 14px 18px;
-  margin-bottom: 18px;
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.brand-mark {
-  width: 38px;
-  height: 38px;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #00b7ff, #7a5cff);
-  display: grid;
-  place-items: center;
-  font-size: 1.1rem;
-  font-weight: 700;
-}
-
-.brand-title {
-  font-weight: 700;
-  font-size: 1.1rem;
-}
-
-.brand-subtitle {
-  font-size: 0.76rem;
-  color: #98b4d4;
-}
-
-.topbar-controls {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.search-box, .symbol-select, .tf-select {
-  background: rgba(16, 29, 39, 0.9);
-  border: 1px solid rgba(129, 154, 188, 0.18);
-  color: #edf5ff;
-  border-radius: 10px;
-  padding: 10px 12px;
-}
-
-.search-box {
-  min-width: 200px;
-}
-
-.symbol-select {
-  min-width: 160px;
-}
-
-.tf-select {
-  min-width: 100px;
-}
-
-.main-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.65fr) minmax(280px, 0.52fr);
-  gap: 18px;
-}
-
-.chart-card {
-  padding: 14px;
-}
-
-.chart-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 12px;
-}
-
-.symbol-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.symbol-name {
-  font-size: 1.6rem;
-  font-weight: 800;
-}
-
-.price-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.95rem;
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: rgba(68, 95, 131, 0.2);
-  border: 1px solid rgba(98, 143, 196, 0.2);
-}
-
-.price-positive {
-  color: #5ee7b7;
-}
-
-.price-negative {
-  color: #ff7a7a;
-}
-
-.chart-wrap {
-  position: relative;
-  height: 640px;
-  border-radius: 14px;
-  overflow: hidden;
-  background: linear-gradient(180deg, rgba(7, 17, 24, 0.98), rgba(8, 13, 21, 0.98));
-  border: 1px solid rgba(130, 151, 172, 0.12);
-}
-
-.chart-wrap > div {
-  width: 100%;
-  height: 100%;
-}
-
-.side-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.signal-box,
-.market-box,
-.history-box,
-.watchlist-box {
-  padding: 16px;
-}
-
-.section-title {
-  margin: 0 0 12px;
-  font-size: 0.9rem;
-  color: #9cb4d3;
-  letter-spacing: 0.04em;
-}
-
-.signal-badge {
-  display: inline-flex;
-  justify-content: center;
-  align-items: center;
-  min-width: 140px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  font-weight: 700;
-  margin-bottom: 8px;
-}
-
-.signal-buy { background: rgba(21, 155, 111, 0.18); color: #79f5bf; border: 1px solid rgba(87, 214, 162, 0.4); }
-.signal-sell { background: rgba(170, 49, 49, 0.18); color: #ff9f9f; border: 1px solid rgba(255, 120, 120, 0.4); }
-.signal-wait { background: rgba(110, 135, 180, 0.14); color: #dfeafc; border: 1px solid rgba(146, 160, 192, 0.3); }
-.signal-neutral { background: rgba(73, 88, 110, 0.15); color: #b8c7db; border: 1px solid rgba(129, 145, 168, 0.25); }
-
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.stat-item {
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(30, 42, 56, 0.65);
-  border: 1px solid rgba(138, 160, 201, 0.1);
-}
-
-.label {
-  display: block;
-  color: #9cb4d3;
-  font-size: 0.72rem;
-  margin-bottom: 6px;
-}
-
-.value {
-  font-size: 1.1rem;
-  font-weight: 700;
-}
-
-.reason-box {
-  margin-top: 14px;
-  padding: 12px;
-  border-radius: 10px;
-  background: rgba(23, 34, 48, 0.8);
-  border: 1px solid rgba(144, 174, 226, 0.12);
-  color: #cfe1ff;
-  font-size: 0.95rem;
-}
-
-.market-metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.metric-box {
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(15, 29, 39, 0.8);
-  border: 1px solid rgba(138, 160, 201, 0.12);
-}
-
-.history-list,
-.watchlist-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.history-item,
-.watchlist-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(15, 28, 38, 0.8);
-  border: 1px solid rgba(135, 156, 190, 0.12);
-}
-
-.history-status {
-  font-size: 0.8rem;
-  padding: 5px 8px;
-  border-radius: 999px;
-}
-
-.status-buy { background: rgba(30, 150, 100, 0.21); color: #73efb7; }
-.status-sell { background: rgba(177, 57, 57, 0.22); color: #ff9d9d; }
-.status-wait { background: rgba(126, 143, 178, 0.2); color: #dfe7f7; }
-.status-neutral { background: rgba(97, 112, 141, 0.2); color: #d0d7e7; }
-
-@media (max-width: 980px) {
-  .main-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .chart-wrap {
-    height: 460px;
-  }
-}
-
-@media (max-width: 640px) {
-  .app-shell {
-    padding: 12px;
-  }
-
-  .topbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .topbar-controls {
-    width: 100%;
-    justify-content: space-between;
-  }
-
-  .search-box,
-  .symbol-select,
-  .tf-select {
-    width: 100%;
-  }
-
-  .brand {
-    width: 100%;
-    justify-content: center;
-  }
-}
+export default App;

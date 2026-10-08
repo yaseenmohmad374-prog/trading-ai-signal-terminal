@@ -1,107 +1,170 @@
-import { Candle, MarketSymbol, Timeframe, TickerData } from '../types';
+import { Candle, Signal } from '../types';
+import { ema, rsi, macd, atr, vwap, getTrend } from './indicators';
 
-const BINANCE_BASE = 'https://api.binance.com';
-const BINANCE_WS = 'wss://stream.binance.com:9443/ws';
-
-const TIMEFRAME_MAP: Record<Timeframe, string> = {
-  '5m': '5m',
-  '10m': '10m',
-  '15m': '15m',
-  '30m': '30m',
-  '1h': '1h',
-  '4h': '4h',
-  '1d': '1d',
-};
-
-export async function fetchAvailableSymbols(): Promise<MarketSymbol[]> {
-  const response = await fetch(`${BINANCE_BASE}/api/v3/exchangeInfo`);
-  if (!response.ok) throw new Error('فشل في تحميل قائمة العملات');
-
-  const data = await response.json();
-  const major = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'AVAX', 'LINK', 'NEAR'];
-
-  const filtered = data.symbols
-    .filter((symbol: any) => symbol.status === 'TRADING')
-    .filter((symbol: any) => {
-      const { quoteAsset, baseAsset } = symbol;
-      const validQuote = quoteAsset === 'USDT' || quoteAsset === 'USD';
-      const isMajor = major.includes(baseAsset);
-      return validQuote && isMajor;
-    })
-    .slice(0, 120)
-    .map((symbol: any) => ({
-      symbol: symbol.symbol,
-      baseAsset: symbol.baseAsset,
-      quoteAsset: symbol.quoteAsset,
-    }));
-
-  const extras = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT', 'XAUUSD', 'EURUSD'];
-  const combined = [...new Set([...extras, ...filtered.map((entry) => entry.symbol)])];
-
-  return combined
-    .filter((item) => !!item)
-    .map((symbol) => ({
-      symbol,
-      baseAsset: symbol.replace(/USDT|USD/gi, ''),
-      quoteAsset: symbol.endsWith('USDT') ? 'USDT' : 'USD',
-    }))
-    .slice(0, 50);
-}
-
-export async function fetchCandles(symbol: string, interval: Timeframe, limit = 240): Promise<Candle[]> {
-  const safeSymbol = symbol.toUpperCase();
-  const response = await fetch(
-    `${BINANCE_BASE}/api/v3/klines?symbol=${safeSymbol}&interval=${TIMEFRAME_MAP[interval]}&limit=${limit}`,
-  );
-
-  if (!response.ok) {
-    throw new Error(`فشل في تحميل الشموع لـ ${safeSymbol}`);
-  }
-
-  const data = await response.json();
-
-  return data.map((entry: any[]) => ({
-    time: Number(entry[0]),
-    open: Number(entry[1]),
-    high: Number(entry[2]),
-    low: Number(entry[3]),
-    close: Number(entry[4]),
-    volume: Number(entry[5]),
-  }));
-}
-
-export async function fetchTicker(symbol: string): Promise<TickerData> {
-  const response = await fetch(`${BINANCE_BASE}/api/v3/ticker/24hr?symbol=${symbol.toUpperCase()}`);
-  if (!response.ok) {
-    throw new Error(`فشل في تحديث السعر لـ ${symbol}`);
-  }
-
-  const data = await response.json();
-
+function neutral(symbol: string, price: number): Signal {
   return {
-    symbol: data.symbol,
-    price: Number(data.lastPrice),
-    changePercent: Number(data.priceChangePercent),
+    id: `${symbol}-${Date.now()}`,
+    symbol,
+    status: 'لا توجد صفقة',
+    direction: 'neutral',
+    entry: price,
+    stopLoss: price,
+    tp1: price,
+    tp2: price,
+    tp3: price,
+    confidence: 0,
+    riskReward: 0,
+    tradeBias: 'محايد',
+    timestamp: new Date().toISOString(),
+    validForMinutes: 5,
+    reason: 'السوق غير واضح - انتظر إشارة أقوى',
+    timeframe: '-',
   };
 }
 
-export function subscribeTicker(symbol: string, onTick: (price: number, changePercent: number) => void) {
-  const ws = new WebSocket(`${BINANCE_WS}/${symbol.toLowerCase()}@ticker`);
+export function analyze(symbol: string, candles5m: Candle[], candles1h: Candle[], candles4h: Candle[], price: number): Signal {
+  if (!candles5m.length || !candles1h.length || !candles4h.length) return neutral(symbol, price);
 
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (!data || !data.c) return;
+  const c5 = candles5m.map((c) => c.close);
+  const c1 = candles1h.map((c) => c.close);
+  const c4 = candles4h.map((c) => c.close);
 
-    onTick(Number(data.c), Number(data.P || 0));
-  };
+  // EMA التقاطعات (أقوى مؤشر)
+  const ema9_5m = ema(c5, 9).at(-1) ?? price;
+  const ema21_5m = ema(c5, 21).at(-1) ?? price;
+  const ema9_1h = ema(c1, 9).at(-1) ?? price;
+  const ema21_1h = ema(c1, 21).at(-1) ?? price;
+  const ema9_4h = ema(c4, 9).at(-1) ?? price;
+  const ema21_4h = ema(c4, 21).at(-1) ?? price;
 
-  ws.onerror = () => {
-    // Ignore transient websocket errors; app will still show REST-based price values.
-  };
+  // RSI
+  const rsi5m = rsi(c5).at(-1) ?? 50;
+  const rsi1h = rsi(c1).at(-1) ?? 50;
 
-  return () => ws.close();
-}
+  // MACD
+  const macdData = macd(c5);
+  const macdHist = macdData.histogram.at(-1) ?? 0;
 
-export function getMajorTimeframes(): Timeframe[] {
-  return ['5m', '10m', '15m', '30m', '1h', '4h', '1d'];
+  // ATR للستوب
+  const atrVal = atr(candles5m, 14);
+  const stopDist = Math.max(atrVal * 0.8, price * 0.01);
+  const tp1Dist = stopDist * 1.5;
+  const tp2Dist = stopDist * 2.5;
+  const tp3Dist = stopDist * 4;
+
+  // اتجاهات الفريمات
+  const trend4h = getTrend(candles4h);
+  const trend1h = getTrend(candles1h);
+
+  // عدد الإشارات الصاعدة
+  const bullPoints =
+    (ema9_5m > ema21_5m ? 1 : 0) +
+    (ema9_1h > ema21_1h ? 1 : 0) +
+    (trend4h === 'up' ? 2 : 0) +
+    (rsi5m > 50 && rsi5m < 70 ? 1 : 0) +
+    (macdHist > 0 ? 1 : 0) +
+    (price > vwap(candles5m) ? 1 : 0);
+
+  // عدد الإشارات الهابطة
+  const bearPoints =
+    (ema9_5m < ema21_5m ? 1 : 0) +
+    (ema9_1h < ema21_1h ? 1 : 0) +
+    (trend4h === 'down' ? 2 : 0) +
+    (rsi5m < 50 && rsi5m > 30 ? 1 : 0) +
+    (macdHist < 0 ? 1 : 0) +
+    (price < vwap(candles5m) ? 1 : 0);
+
+  // تصفية قوية
+  const strongBuy =
+    bullPoints >= 6 && trend1h === 'up' && trend4h === 'up' && rsi5m > 45 && rsi5m < 75;
+  const strongSell =
+    bearPoints >= 6 && trend1h === 'down' && trend4h === 'down' && rsi5m < 55 && rsi5m > 25;
+  const regularBuy = bullPoints >= 4 && trend1h === 'up';
+  const regularSell = bearPoints >= 4 && trend1h === 'down';
+
+  if (strongBuy) {
+    return {
+      id: `${symbol}-${Date.now()}`,
+      symbol,
+      status: 'شراء قوي',
+      direction: 'buy',
+      entry: price,
+      stopLoss: price - stopDist,
+      tp1: price + tp1Dist,
+      tp2: price + tp2Dist,
+      tp3: price + tp3Dist,
+      confidence: Math.min(85 + (bullPoints - 6) * 2, 96),
+      riskReward: Number((tp1Dist / stopDist).toFixed(2)),
+      tradeBias: 'شراء',
+      timestamp: new Date().toISOString(),
+      validForMinutes: 20,
+      reason: `✓ EMA صاعد | ✓ Trend قوي صاعد | RSI ${rsi5m.toFixed(0)} | ✓ MACD موجب | فرصة شراء قوية جداً`,
+      timeframe: '5m/1h/4h',
+    };
+  }
+
+  if (strongSell) {
+    return {
+      id: `${symbol}-${Date.now()}`,
+      symbol,
+      status: 'بيع قوي',
+      direction: 'sell',
+      entry: price,
+      stopLoss: price + stopDist,
+      tp1: price - tp1Dist,
+      tp2: price - tp2Dist,
+      tp3: price - tp3Dist,
+      confidence: Math.min(85 + (bearPoints - 6) * 2, 96),
+      riskReward: Number((tp1Dist / stopDist).toFixed(2)),
+      tradeBias: 'بيع',
+      timestamp: new Date().toISOString(),
+      validForMinutes: 20,
+      reason: `✓ EMA هابط | ✓ Trend قوي هابط | RSI ${rsi5m.toFixed(0)} | ✓ MACD سالب | فرصة بيع قوية جداً`,
+      timeframe: '5m/1h/4h',
+    };
+  }
+
+  if (regularBuy) {
+    return {
+      id: `${symbol}-${Date.now()}`,
+      symbol,
+      status: 'شراء',
+      direction: 'buy',
+      entry: price,
+      stopLoss: price - stopDist,
+      tp1: price + tp1Dist,
+      tp2: price + tp2Dist,
+      tp3: price + tp3Dist,
+      confidence: Math.min(65 + (bullPoints - 4) * 2, 80),
+      riskReward: Number((tp1Dist / stopDist).toFixed(2)),
+      tradeBias: 'شراء',
+      timestamp: new Date().toISOString(),
+      validForMinutes: 15,
+      reason: `اتجاه صاعد على 5m و 1h | RSI ${rsi5m.toFixed(0)} | فرصة شراء معقولة`,
+      timeframe: '5m/1h/4h',
+    };
+  }
+
+  if (regularSell) {
+    return {
+      id: `${symbol}-${Date.now()}`,
+      symbol,
+      status: 'بيع',
+      direction: 'sell',
+      entry: price,
+      stopLoss: price + stopDist,
+      tp1: price - tp1Dist,
+      tp2: price - tp2Dist,
+      tp3: price - tp3Dist,
+      confidence: Math.min(65 + (bearPoints - 4) * 2, 80),
+      riskReward: Number((tp1Dist / stopDist).toFixed(2)),
+      tradeBias: 'بيع',
+      timestamp: new Date().toISOString(),
+      validForMinutes: 15,
+      reason: `اتجاه هابط على 5m و 1h | RSI ${rsi5m.toFixed(0)} | فرصة بيع معقولة`,
+      timeframe: '5m/1h/4h',
+    };
+  }
+
+  return neutral(symbol, price);
 }

@@ -1,6 +1,5 @@
-export type Timeframe = '5m' | '10m' | '15m' | '30m' | '1h' | '4h' | '1d';
-export type SignalStatus = 'شراء قوي' | 'شراء' | 'انتظار' | 'بيع' | 'بيع قوي' | 'لا توجد صفقة';
-export type SignalDirection = 'buy' | 'sell' | 'neutral';
+export type SignalStatus = 'شراء قوي' | 'شراء' | 'لا توجد صفقة' | 'بيع' | 'بيع قوي';
+export type Direction = 'buy' | 'sell' | 'neutral';
 
 export interface Candle {
   time: number;
@@ -11,18 +10,11 @@ export interface Candle {
   volume: number;
 }
 
-export interface MarketSymbol {
-  symbol: string;
-  baseAsset: string;
-  quoteAsset: string;
-}
-
 export interface Signal {
   id: string;
   symbol: string;
   status: SignalStatus;
-  direction: SignalDirection;
-  timeframe: string;
+  direction: Direction;
   entry: number;
   stopLoss: number;
   tp1: number;
@@ -30,14 +22,9 @@ export interface Signal {
   tp3: number;
   confidence: number;
   riskReward: number;
-  tradeBias: 'شراء' | 'بيع' | 'محايد';
+  tradeBias: string;
   timestamp: string;
   validForMinutes: number;
   reason: string;
-}
-
-export interface TickerData {
-  symbol: string;
-  price: number;
-  changePercent: number;
+  timeframe: string;
 }

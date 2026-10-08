@@ -1,12 +1,11 @@
 {
-  "name": "trading-ai-signal-terminal",
-  "private": true,
-  "version": "0.1.0",
+  "name": "trading-ai-terminal",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
+    "dev": "vite --host",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host"
   },
   "dependencies": {
     "lightweight-charts": "^5.0.3",
